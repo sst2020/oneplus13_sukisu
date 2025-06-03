@@ -1,0 +1,470 @@
+name: OnePlus 13 Build v7 (Merged from upstream - preserves all branch features)
+on:
+  workflow_dispatch:
+    inputs:
+      CPU:
+        description: "Select compilation CPU type"
+        required: true
+        default: 'sm8750'
+      FEIL:
+        description: "Device configuration"
+        required: true
+        default: 'oneplus_13'
+      CPUD:
+        description: "Processor codename"
+        required: true
+        default: 'sun'
+      ANDROID_VERSION:
+        description: "Kernel Android Version"
+        required: true
+        default: 'android15'
+      KERNEL_VERSION:
+        description: "Kernel version"
+        required: true
+        default: '6.6'
+      KERNEL_SUFFIX:
+        description: '内核名称修改(可改中文和emoji) - Synced from upstream'
+        required: true
+        default: '-酷安FutabaWa'
+      KERNEL_TIME:
+       description: "内核构建日期更改(默认为原厂) - Synced from upstream"
+       required: true
+       default: 'Tue Dec 17 23:36:49 UTC 2024'
+      enable_feature_x: # KPM
+       description: "是否启用kpm - Synced from upstream"
+       required: false
+       default: false
+       type: boolean
+      enable_feature_y: # LZ4KD for ZRAM
+       description: "是否启用lz4kd - Synced from upstream" 
+       required: false
+       default: false 
+       type: boolean
+      enable_feature_z: # FengChi driver
+       description: "是否添加风驰驱动 - Synced from upstream"
+       required: false
+       default: false
+       type: boolean
+      
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+      CCACHE_DIR: /home/runner/.ccache
+      CCACHE_MAXSIZE: 8G
+    outputs:
+      zip_name: ${{ steps.prepare_zip.outputs.zip_filename }}
+
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192 
+          temp-reserve-mb: 2048 
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          
+      - name: Check out repository code
+        uses: actions/checkout@v4
+          
+      - name: Configure Git
+        run: |
+          git config --global user.name "Futaba" 
+          git config --global user.email "3199167602@qq.com" 
+
+      - name: Install dependencies
+        run: |
+          sudo apt update && sudo apt upgrade -y
+          sudo apt install -y python3 git curl patch ccache
+
+      - name: Restore ccache
+        uses: actions/cache@v3
+        id: ccache 
+        with:
+          path: ${{ env.CCACHE_DIR }} 
+          key: ccache-${{ runner.os }}-${{ github.ref }}-${{ github.sha }} 
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ github.ref }}-
+            ccache-${{ runner.os }}-
+      
+      - name: Setup ccache
+        if: steps.ccache.outputs.cache-hit != 'true'
+        run: |
+          echo "Initializing ccache..." 
+          ccache -Cz 
+          ccache -M ${{ env.CCACHE_MAXSIZE }}
+          echo "Ccache initialized and max size set to ${{ env.CCACHE_MAXSIZE }}."
+        
+      - name: Display ccache stats before operations
+        run: |
+          echo "Initial Ccache statistics:"
+          ccache -s
+
+      - name: Install repo tool
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/bin
+          curl -sSL https://storage.googleapis.com/git-repo-downloads/repo > $GITHUB_WORKSPACE/bin/repo
+          chmod a+x $GITHUB_WORKSPACE/bin/repo
+          echo "$GITHUB_WORKSPACE/bin" >> $GITHUB_PATH
+          echo "Repo tool installed." 
+
+      - name: Clone TheWildJames Patches Repo (for 69_hide_stuff.patch)
+        run: |
+          git clone https://github.com/TheWildJames/kernel_patches.git TheWildJames_kernel_patches --depth=1
+
+      - name: Initialize repo and sync
+        run: |
+          set -e 
+          which repo || (echo "ERROR: 'which repo' did not find repo in PATH after Install repo tool step." && exit 1)
+          
+          mkdir kernel_workspace && cd kernel_workspace
+          repo init -u https://github.com/HanKuCha/kernel_manifest.git -b refs/heads/oneplus/${{ github.event.inputs.CPU }} -m ${{ github.event.inputs.FEIL }}.xml --depth=1
+          repo --trace sync -c -j$(nproc --all) --no-tags --no-clone-bundle --optimized-fetch --fail-fast
+          rm kernel_platform/common/android/abi_gki_protected_exports_* || echo "No protected exports!"
+          rm kernel_platform/msm-kernel/android/abi_gki_protected_exports_* || echo "No protected exports!"
+         
+      - name: Set up SukiSU
+        run: | 
+          set -e
+          cd $GITHUB_WORKSPACE/kernel_workspace/kernel_platform
+          curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-dev
+          cd ./KernelSU
+          KSU_VERSION_VALUE=$(expr $(/usr/bin/git rev-list --count main) "+" 10606) 
+          echo "KSUVER=${KSU_VERSION_VALUE}" >> $GITHUB_ENV 
+          sed -i "s/DKSU_VERSION=12800/DKSU_VERSION=${KSU_VERSION_VALUE}/" kernel/Makefile 
+        
+      - name: Set up susfs
+        run: |
+          set -e 
+          cd $GITHUB_WORKSPACE/kernel_workspace/kernel_platform
+
+          SUSFS_CLONE_TARGET_REL="../susfs4ksu" 
+          SUKISU_PATCH_CLONE_TARGET_REL="../SukiSU_patch"
+          SUSFS_BRANCH="gki-${{ github.event.inputs.ANDROID_VERSION }}-${{ github.event.inputs.KERNEL_VERSION }}"
+
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b "${SUSFS_BRANCH}" "${SUSFS_CLONE_TARGET_REL}" --depth=1
+          if [ ! -d "${SUSFS_CLONE_TARGET_REL}" ]; then echo "ERROR: Failed to clone susfs4ksu"; exit 1; fi
+
+          git clone https://github.com/ShirkNeko/SukiSU_patch.git "${SUKISU_PATCH_CLONE_TARGET_REL}" --depth=1
+          if [ ! -d "${SUKISU_PATCH_CLONE_TARGET_REL}" ]; then echo "ERROR: Failed to clone SukiSU_patch"; exit 1; fi
+
+          PATCH_FILE_NAME="50_add_susfs_in_${SUSFS_BRANCH}.patch" 
+          EXPECTED_PATCH_PATH="${SUSFS_CLONE_TARGET_REL}/kernel_patches/${PATCH_FILE_NAME}"
+
+          if [ ! -f "${EXPECTED_PATCH_PATH}" ]; then
+              echo "ERROR: SUSFS Patch file ${EXPECTED_PATCH_PATH} not found!"
+              exit 1
+          fi
+          
+          cp "${EXPECTED_PATCH_PATH}" ./common/
+          cp "${SUSFS_CLONE_TARGET_REL}/kernel_patches/fs/"* ./common/fs/
+          cp "${SUSFS_CLONE_TARGET_REL}/kernel_patches/include/linux/"* ./common/include/linux/
+          cp -r "${SUKISU_PATCH_CLONE_TARGET_REL}/other/zram/lz4k/include/linux/"* ./common/include/linux/
+          cp -r "${SUKISU_PATCH_CLONE_TARGET_REL}/other/zram/lz4k/lib/"* ./common/lib/
+          cp -r "${SUKISU_PATCH_CLONE_TARGET_REL}/other/zram/lz4k/crypto/"* ./common/crypto/
+          if ! ${{ inputs.enable_feature_y }}; then 
+            echo "LZ4KD is disabled, copying lz4k_oplus."
+            cp -r "${SUKISU_PATCH_CLONE_TARGET_REL}/other/zram/lz4k_oplus" ./common/lib/
+          else
+            echo "LZ4KD is enabled, skipping lz4k_oplus to avoid potential conflict."
+          fi
+          
+          cd ./common 
+
+          sed -i 's/-32,12 +32,38/-32,11 +32,37/g' "${PATCH_FILE_NAME}"
+          sed -i '/#include <trace\/hooks\/fs.h>/d' "${PATCH_FILE_NAME}"
+
+          patch -p1 < "${PATCH_FILE_NAME}" || echo "WARN: SUSFS base patch may not have applied cleanly."
+          cp "${GITHUB_WORKSPACE}/kernel_workspace/SukiSU_patch/hooks/syscall_hooks.patch" ./ 
+          patch -p1 -F 3 < syscall_hooks.patch
+          echo "Finished 'Set up susfs' step."
+
+      - name: Apply HMBird GKI patch
+        run: |
+          set -e
+          echo "Applying HMBird GKI patch..."
+          HMBIRD_PATCH_DIR="$GITHUB_WORKSPACE/kernel_workspace/kernel_platform/common/drivers"
+          HMBIRD_SOURCE_FILE="$GITHUB_WORKSPACE/kernel_addons/hmbird_patch.c" 
+
+          if [ ! -f "$HMBIRD_SOURCE_FILE" ]; then
+            echo "CRITICAL ERROR: $HMBIRD_SOURCE_FILE not found!" 
+            exit 1
+          fi
+          
+          mkdir -p "$HMBIRD_PATCH_DIR"
+          cp "$HMBIRD_SOURCE_FILE" "$HMBIRD_PATCH_DIR/"
+          echo "hmbird_patch.c copied to drivers directory."
+          
+          cd "$HMBIRD_PATCH_DIR"
+          if [ -f "Makefile" ]; then
+              if ! grep -q "hmbird_patch.o" Makefile; then
+                echo "obj-y += hmbird_patch.o" >> Makefile
+                echo "HMBird patch object added to drivers/Makefile."
+              else
+                echo "HMBird patch object already in drivers/Makefile."
+              fi
+          else
+              echo "obj-y += hmbird_patch.o" > Makefile
+              echo "Created drivers/Makefile and added HMBird patch object."
+          fi
+          
+          cd $GITHUB_WORKSPACE/kernel_workspace/kernel_platform 
+          if ! git diff --quiet HEAD -- common/drivers/hmbird_patch.c common/drivers/Makefile; then
+             echo "Committing HMBird GKI patch module to local kernel source tree..."
+             git add common/drivers/hmbird_patch.c common/drivers/Makefile
+             git commit -m "Add HMBird GKI patch module"
+          else
+             echo "No new HMBird files or Makefile changes found to commit in kernel_platform."
+          fi
+          echo "Finished HMBird GKI patch application."
+
+      - name: Apply LZ4KD Patches for ZRAM (if enabled)
+        if: ${{ inputs.enable_feature_y == true }} 
+        run: |
+          set -e
+          echo "LZ4KD for ZRAM is enabled. Applying patch..."
+          cd $GITHUB_WORKSPACE/kernel_workspace/kernel_platform/common
+          if [ ! -d "${GITHUB_WORKSPACE}/kernel_workspace/SukiSU_patch" ]; then 
+            echo "Cloning SukiSU_patch for LZ4KD patch..."
+            git clone https://github.com/ShirkNeko/SukiSU_patch.git ${GITHUB_WORKSPACE}/kernel_workspace/SukiSU_patch --depth=1
+          fi
+          cp "${GITHUB_WORKSPACE}/kernel_workspace/SukiSU_patch/other/zram/zram_patch/${{ github.event.inputs.KERNEL_VERSION }}/lz4kd.patch" ./
+          patch -p1 -F 3 < lz4kd.patch || echo "WARN: lz4kd patch for ZRAM failed."
+      
+      - name: Apply ECN and TCP Pacing Tweaks via SED
+        run: |
+          set -e
+          TCP_IPV4_PATH="$GITHUB_WORKSPACE/kernel_workspace/kernel_platform/common/net/ipv4/tcp_ipv4.c"
+          if [ ! -f "$TCP_IPV4_PATH" ]; then echo "ERROR: $TCP_IPV4_PATH not found!"; exit 1; fi
+
+          sed -i 's/net->ipv4.sysctl_tcp_ecn = 2;/net->ipv4.sysctl_tcp_ecn = 1;/' "$TCP_IPV4_PATH"
+          sed -i 's/net->ipv4.sysctl_tcp_pacing_ss_ratio = 200;/net->ipv4.sysctl_tcp_pacing_ss_ratio = 150;/' "$TCP_IPV4_PATH"
+          sed -i 's/net->ipv4.sysctl_tcp_pacing_ca_ratio = 120;/net->ipv4.sysctl_tcp_pacing_ca_ratio = 110;/' "$TCP_IPV4_PATH"
+          echo "ECN and TCP Pacing tweaks successfully applied via SED."
+          
+      - name: Add Kernel Configuration Settings and Custom Kernel Name
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE/kernel_workspace/kernel_platform
+          DEFCONFIG_PATH="./common/arch/arm64/configs/gki_defconfig"
+          
+          # Base KSU and SUSFS configs
+          echo "CONFIG_KSU=y" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_KSU_SUSFS_SUS_SU=n" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_KSU_MANUAL_HOOK=y" >> "${DEFCONFIG_PATH}" 
+          echo "CONFIG_KSU_SUSFS=y" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "${DEFCONFIG_PATH}"
+
+          # Crypto and Network Optimizations
+          echo "CONFIG_CRYPTO_LZ4HC=y" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_CRYPTO_LZ4K=y" >> "${DEFCONFIG_PATH}" 
+          echo "CONFIG_CRYPTO_842=y" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_TCP_CONG_ADVANCED=y" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_TCP_CONG_BBR=y" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_DEFAULT_BBR=y" >> "${DEFCONFIG_PATH}" 
+          echo 'CONFIG_DEFAULT_TCP_CONG="bbr"' >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_NET_SCH_FQ=y" >> "${DEFCONFIG_PATH}" 
+          echo "CONFIG_DEFAULT_FQ=y" >> "${DEFCONFIG_PATH}" 
+          echo 'CONFIG_DEFAULT_NET_SCH="fq"' >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_TCP_CONG_BIC=n" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_TCP_CONG_WESTWOOD=n" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_TCP_CONG_HTCP=n" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_IP_NF_TARGET_TTL=y" >> "${DEFCONFIG_PATH}" 
+          echo "CONFIG_IP6_NF_TARGET_HL=y" >> "${DEFCONFIG_PATH}" 
+          echo "CONFIG_IP6_NF_MATCH_HL=y" >> "${DEFCONFIG_PATH}" 
+          echo "CONFIG_IP_NF_TARGET_ECN=y" >> "${DEFCONFIG_PATH}"
+          
+          # ZRAM Compression Settings
+          if [ "${{ github.event.inputs.KERNEL_VERSION }}" != "5.10" ]; then
+            echo "CONFIG_ZRAM_DEF_COMP_LZORLE=n" >> "${DEFCONFIG_PATH}"
+            echo "CONFIG_ZRAM_DEF_COMP_LZO=n" >> "${DEFCONFIG_PATH}"
+            if ${{ inputs.enable_feature_y }}; then 
+              echo "CONFIG_CRYPTO_LZ4KD=y" >> "${DEFCONFIG_PATH}" 
+              echo "# LZ4KD for ZRAM is enabled via feature flag" >> "${DEFCONFIG_PATH}"
+              echo "CONFIG_ZRAM_DEF_COMP_LZ4=n" >> "${DEFCONFIG_PATH}" 
+              echo "CONFIG_ZRAM_DEF_COMP_LZ4KD=y" >> "${DEFCONFIG_PATH}"
+              echo 'CONFIG_ZRAM_DEF_COMP="lz4kd"' >> "${DEFCONFIG_PATH}"
+            else
+              sed -i '/CONFIG_CRYPTO_LZ4KD/d' "${DEFCONFIG_PATH}" 
+              echo "# CONFIG_CRYPTO_LZ4KD is not set" >> "${DEFCONFIG_PATH}"
+              echo "# Standard LZ4 for ZRAM" >> "${DEFCONFIG_PATH}"
+              echo "CONFIG_ZRAM_DEF_COMP_LZ4=y" >> "${DEFCONFIG_PATH}" 
+              echo 'CONFIG_ZRAM_DEF_COMP="lz4"' >> "${DEFCONFIG_PATH}"
+            fi
+          else 
+            echo "# Default ZRAM compression for Kernel 5.10 (e.g., LZ4)" >> "${DEFCONFIG_PATH}"
+            echo "CONFIG_ZRAM_DEF_COMP_LZ4=y" >> "${DEFCONFIG_PATH}" 
+            echo 'CONFIG_ZRAM_DEF_COMP="lz4"' >> "${DEFCONFIG_PATH}"
+            sed -i '/CONFIG_CRYPTO_LZ4KD/d' "${DEFCONFIG_PATH}" 
+            echo "# CONFIG_CRYPTO_LZ4KD is not set" >> "${DEFCONFIG_PATH}"
+          fi
+          
+          echo "CONFIG_RCU_TRACE=n" >> "${DEFCONFIG_PATH}"
+
+          # Hibernation Settings
+          echo "CONFIG_HIBERNATION=y" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_HIBERNATION_COMPRESS=y" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_HIBERNATION_COMPRESS_ALGO_LZ4=y" >> "${DEFCONFIG_PATH}"
+
+          # TMPFS XATTR and POSIX ACL Support
+          echo "CONFIG_TMPFS_XATTR=y" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_TMPFS_POSIX_ACL=y" >> "${DEFCONFIG_PATH}"
+
+          # Wireguard Support
+          echo "CONFIG_WIREGUARD=y" >> "${DEFCONFIG_PATH}"
+          echo "CONFIG_INET=y" >> "${DEFCONFIG_PATH}" 
+          echo "CONFIG_NET_UDP_TUNNEL=y" >> "${DEFCONFIG_PATH}" 
+          echo "CONFIG_CRYPTO_LIB_CHACHA20POLY1305=y" >> "${DEFCONFIG_PATH}" 
+          echo "CONFIG_CRYPTO_LIB_POLY1305=y" >> "${DEFCONFIG_PATH}" 
+          echo "CONFIG_CRYPTO_LIB_CURVE25519=y" >> "${DEFCONFIG_PATH}" 
+
+          # Kernel Name defconfig settings (updated to use KERNEL_SUFFIX from upstream)
+          echo "Modifying defconfig for custom kernel name..."
+          sed -i '/CONFIG_LOCALVERSION_AUTO/d' "${DEFCONFIG_PATH}" 
+          echo "CONFIG_LOCALVERSION_AUTO=n" >> "${DEFCONFIG_PATH}" 
+          sed -i '/CONFIG_LOCALVERSION=/d' "${DEFCONFIG_PATH}" 
+          echo "CONFIG_LOCALVERSION=\"${{ github.event.inputs.KERNEL_SUFFIX }}\"" >> "${DEFCONFIG_PATH}"
+          echo "Defconfig set: CONFIG_LOCALVERSION=\"${{ github.event.inputs.KERNEL_SUFFIX }}\""
+
+          sudo sed -i 's/check_defconfig//' ./common/build.config.gki
+          cd common
+          git add -A && git commit -m "Update defconfig with features, custom name, hibernation, ZRAM logic, TMPFS, BBR/FQ, Wireguard" --allow-empty || echo "No defconfig changes to commit."
+      
+      - name: Add KPM Configuration Settings
+        if: ${{ inputs.enable_feature_x == true }}
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE/kernel_workspace/kernel_platform
+          echo "CONFIG_KPM=y" >> ./common/arch/arm64/configs/gki_defconfig
+          sudo sed -i 's/check_defconfig//' ./common/build.config.gki
+          cd common
+          git add -A && git commit -m "Add KPM config to defconfig" --allow-empty || echo "No KPM defconfig changes to commit."
+
+      - name: Apply Hide Stuff Patch 
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE/kernel_workspace/kernel_platform/common
+          if [ -f "$GITHUB_WORKSPACE/TheWildJames_kernel_patches/69_hide_stuff.patch" ]; then
+            cp $GITHUB_WORKSPACE/TheWildJames_kernel_patches/69_hide_stuff.patch ./
+            patch -p1 --no-backup-if-mismatch < 69_hide_stuff.patch || echo "WARN: 69_hide_stuff.patch failed or applied with issues."
+          else
+            echo "WARN: 69_hide_stuff.patch not found in cloned TheWildJames_kernel_patches repo, skipping."
+          fi
+                 
+      - name: Add sched_ext (FengChi driver)
+        if: ${{ inputs.enable_feature_z == true }}
+        run: |
+         set -e
+         echo "Adding sched_ext (FengChi driver)..."
+         cd $GITHUB_WORKSPACE/kernel_workspace/kernel_platform/
+         git clone https://github.com/HanKuCha/sched_ext.git ./sched_ext_temp --depth=1
+         cp -r ./sched_ext_temp/* ./common/kernel/sched
+         rm -rf ./sched_ext_temp
+         cd $GITHUB_WORKSPACE/kernel_workspace/kernel_platform/common 
+         if git status --porcelain | grep -q "kernel/sched"; then # Check if there are changes in sched directory
+            git add kernel/sched/
+            git commit -m "Add/Update sched_ext (FengChi driver)"
+         else
+            echo "No changes in kernel/sched to commit for sched_ext."
+         fi
+         
+      - name: Set Kernel build timestamp
+        run: |
+          export SOURCE_DATE_EPOCH=$(date -d "${{ github.event.inputs.KERNEL_TIME }}" +%s)
+          echo "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" >> $GITHUB_ENV
+          
+      - name: Build Kernel
+        run: |
+           set -e
+           cd $GITHUB_WORKSPACE/kernel_workspace/kernel_platform
+           export SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
+           export PATH="/usr/lib/ccache:$PATH" 
+           echo "Using CCACHE directory: $CCACHE_DIR"
+           echo "Ccache statistics before build:"
+           ccache -s
+
+           tools/bazel run --config=fast --config=stamp --lto=thin --verbose_failures //common:kernel_aarch64_dist -- --dist_dir=dist
+           
+           echo "Ccache statistics after build:"
+           ccache -s
+
+      - name: Make AnyKernel3 (Patch Image)
+        run: |
+         set -e
+         cd $GITHUB_WORKSPACE/kernel_workspace/kernel_platform/dist/
+         curl -LO https://github.com/ShirkNeko/SukiSU_KernelPatch_patch/releases/download/0.11-beta/patch_linux
+         chmod +x patch_linux
+         ./patch_linux
+         if [ -f "oImage" ]; then
+           rm -f Image 
+           mv oImage Image
+         else
+           echo "WARN: oImage not found. Assuming patch_linux modified Image in-place or did not create oImage."
+         fi
+         
+      - name: Prepare AnyKernel3 Zip
+        id: prepare_zip 
+        run: |
+         set -e
+         cd $GITHUB_WORKSPACE 
+         
+         FINAL_ZIP_NAME="SuKiSu_GKI_${KSUVER}_${{ inputs.FEIL }}"
+         if ${{ inputs.enable_feature_y }}; then
+           FINAL_ZIP_NAME="${FINAL_ZIP_NAME}_LZ4KD"
+         else
+           FINAL_ZIP_NAME="${FINAL_ZIP_NAME}_LZ4"
+         fi
+         FINAL_ZIP_NAME="${FINAL_ZIP_NAME}_BBR_ECN" 
+         if ${{ inputs.enable_feature_x }}; then 
+           FINAL_ZIP_NAME="${FINAL_ZIP_NAME}_KPM"
+         fi
+         if ${{ inputs.enable_feature_z }}; then
+           FINAL_ZIP_NAME="${FINAL_ZIP_NAME}_FengChi"
+         fi
+         
+         FINAL_ZIP_NAME="${FINAL_ZIP_NAME}_ehsan149.zip" 
+
+         echo "Generated ZIP filename: ${FINAL_ZIP_NAME}"
+         echo "zip_filename=${FINAL_ZIP_NAME}" >> $GITHUB_OUTPUT
+
+         git clone https://github.com/HanKuCha/AnyKernel3.git AnyKernel3_Package --depth=1      
+         rm -rf ./AnyKernel3_Package/.git
+         rm -rf ./AnyKernel3_Package/push.sh
+         
+         if [ -f "$GITHUB_WORKSPACE/kernel_workspace/kernel_platform/dist/Image" ]; then
+           cp $GITHUB_WORKSPACE/kernel_workspace/kernel_platform/dist/Image ./AnyKernel3_Package/
+           echo "Image copied to AnyKernel3_Package."
+         else
+           echo "ERROR: $GITHUB_WORKSPACE/kernel_workspace/kernel_platform/dist/Image not found for AnyKernel3 packaging!"
+           exit 1
+         fi
+         
+         cd AnyKernel3_Package
+         zip -r9 "../${FINAL_ZIP_NAME}" .
+         cd ..
+        env:
+          KSUVER: ${{ env.KSUVER }} 
+
+      - name: Upload AnyKernel3 Zip
+        uses: actions/upload-artifact@v4
+        with:
+         name: ${{ steps.prepare_zip.outputs.zip_filename }}
+         path: ${{ steps.prepare_zip.outputs.zip_filename }}
